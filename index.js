@@ -1,42 +1,187 @@
 const express = require('express');
 const cors = require('cors');
-const { LexRuntimeV2 } = require('@aws-sdk/client-lex-runtime-v2');
 const bodyParser = require('body-parser');
-require('dotenv').config();  // To load environment variables from a .env file
+const aws = require('aws-sdk');
+const multer = require('multer');
+const zlib = require('zlib');
+const path = require('path');
+const fs = require('fs');
+const { LexRuntimeV2, RecognizeUtteranceCommand } = require('@aws-sdk/client-lex-runtime-v2');
+require('dotenv').config();
+const ffmpeg = require('fluent-ffmpeg');
+const ffmpegPath = require('ffmpeg-static');
+const buffer = require('buffer');
+const { type } = require('file-type');
+
+ffmpeg.setFfmpegPath(ffmpegPath);
 
 const app = express();
 const port = process.env.PORT || 8080;
 
 app.use(cors());
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: '10mb' }));
 
-const lexruntime = new LexRuntimeV2({
-  region: process.env.AWS_REGION,
+// Set up AWS SDK
+aws.config.update({
+  region: 'us-west-2', // Update to your region
   credentials: {
     accessKeyId: process.env.AWS_ACCESS_KEY_ID,
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
   },
 });
 
-app.post('/lex', async (req, res) => {
-  const { text, sessionId } = req.body;
+// Create LexRuntimeV2 client
+const lexruntime = new LexRuntimeV2({ region: 'us-east-1' }); // Update to your region
 
-  const lexparams = {
-    botAliasId: process.env.LEX_BOT_ALIAS_ID,
-    botId: process.env.LEX_BOT_ID,
-    localeId: 'en_US',
-    text,
-    sessionId,
-  };
+// Set up multer for handling file uploads
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, 'uploads/');
+  },
+  filename: (req, file, cb) => {
+    cb(null, file.fieldname + '-' + Date.now() + path.extname(file.originalname));
+  }
+});
+const upload = multer({ storage: storage });
+
+app.post('/upload', upload.single('audio'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).send('No file uploaded');
+  }
+  let audioFilePath = req.file.path;
 
   try {
-    const data = await lexruntime.recognizeText(lexparams);
-    res.json(data);
+    let audioInfo = getAudioInfo(audioFilePath);
+
+    // If the audio file is not in the correct format, convert it
+    if (!audioInfo || audioInfo.sampleRate !== 16000 || audioInfo.channels !== 1) {
+      console.log('Converting audio file to 16kHz mono...');
+      const convertedFileName = `converted-${Date.now()}.wav`;
+      const convertedFilePath = path.join('uploads', convertedFileName);
+
+      await convertToWav(audioFilePath, convertedFilePath);
+
+      audioInfo = getAudioInfo(convertedFilePath);
+
+      if (audioInfo.sampleRate !== 16000 || audioInfo.channels !== 1) {
+        return res.status(400).send('Error converting audio file to 16000 Hz mono.');
+      }
+
+      audioFilePath = convertedFilePath;
+    }
+
+    // Read the audio file from the saved file in the uploads folder
+    const audioBuffer = fs.readFileSync(audioFilePath);
+
+    // Compress the sessionState and requestAttributes if needed
+    const sessionState = req.body.sessionState ?
+      compressAndEncodeBase64(req.body.sessionState) :
+      compressAndEncodeBase64({ dialogAction: { type: "ElicitIntent" } });
+
+    const requestAttributes = req.body.requestAttributes ?
+      compressAndEncodeBase64(req.body.requestAttributes) :
+      compressAndEncodeBase64({});
+
+    const params = {
+      botAliasId: process.env.LEX_BOT_ALIAS_ID,
+      botId: process.env.LEX_BOT_ID,
+      localeId: 'en_US',
+      sessionId: 1361151,
+      requestContentType: 'audio/l16; rate=16000; channels=1',
+      responseContentType: 'audio/mpeg',
+      inputStream: audioBuffer,
+      sessionState: sessionState,
+      requestAttributes: requestAttributes,
+    };
+
+    const command = new RecognizeUtteranceCommand(params);
+    const data = await lexruntime.send(command);
+    let audioData;
+
+    if (data.messages) {
+      const decodedBuffer = Buffer.from(data.messages, 'base64');
+      const decompressedData = zlib.unzipSync(decodedBuffer);
+
+      // audioData = decompressedData;
+
+      // Identify audio format (optional)
+      const audioType = await type(decompressedData);
+      if (audioType) {
+        audioData = decompressedData; // Use this data for audio playback
+      } else {
+        console.warn('Received data in messages field is not recognized as audio.');
+      }
+    }
+
+    // Send text transcript and potentially audio data to React
+    res.json({
+      textTranscript: data.inputTranscript,
+      audioData: audioData, // Include audio data if identified
+    });
+
+    // const responseAudio = data.audioStream;
+    // const decodedAudio = Buffer.from(responseAudio).toString('base64');
+
+    // const nextSessionState = data.sessionAttributes ?
+    //   Buffer.from(JSON.stringify(data.sessionAttributes)).toString('base64') :
+    //   null;
+
+    // res.json({
+    //   audio: decodedAudio,
+    //   sessionState: nextSessionState
+    // });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error(err);
+    res.status(500).send('Error processing audio');
+  } finally {
+    // Cleanup: Remove the uploaded file
+    fs.unlinkSync(audioFilePath);
   }
 });
 
 app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+  console.log(`Server running on http://localhost:${port}`);
 });
+
+// Helper functions
+function compressAndEncodeBase64(object) {
+  const jsonString = JSON.stringify(object);
+  const compressed = zlib.gzipSync(jsonString);
+  return compressed.toString('base64');
+}
+
+function getAudioInfo(audioFilePath) {
+  try {
+    // Read the file as an array buffer
+    const audioBuffer = fs.readFileSync(audioFilePath);
+
+    // Check if it's a valid WAV file (first 4 bytes should be "RIFF")
+    if (audioBuffer.toString('utf8', 0, 4) !== 'RIFF') {
+      return null;
+    }
+
+    // Get sample rate and channels from header data (assuming WAV format)
+    const sampleRate = audioBuffer.readUInt32LE(24);
+    const channels = audioBuffer.readUInt16LE(22);
+
+    return {
+      sampleRate,
+      channels,
+    };
+  } catch (err) {
+    console.error('Error getting audio info:', err);
+    return null;
+  }
+}
+
+function convertToWav(inputFilePath, outputFilePath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg(inputFilePath)
+      .output(outputFilePath)
+      .audioChannels(1)
+      .audioFrequency(16000)
+      .on('end', resolve)
+      .on('error', reject)
+      .run();
+  });
+}
