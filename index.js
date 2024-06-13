@@ -10,8 +10,7 @@ const { LexRuntimeV2, RecognizeUtteranceCommand } = require('@aws-sdk/client-lex
 require('dotenv').config();
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
-const buffer = require('buffer');
-const { type } = require('file-type');
+const base64 = require('base-64');
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
@@ -86,7 +85,7 @@ app.post('/upload', upload.single('audio'), async (req, res) => {
       botAliasId: process.env.LEX_BOT_ALIAS_ID,
       botId: process.env.LEX_BOT_ID,
       localeId: 'en_US',
-      sessionId: 1361151,
+      sessionId: 136344,
       requestContentType: 'audio/l16; rate=16000; channels=1',
       responseContentType: 'audio/mpeg',
       inputStream: audioBuffer,
@@ -96,40 +95,25 @@ app.post('/upload', upload.single('audio'), async (req, res) => {
 
     const command = new RecognizeUtteranceCommand(params);
     const data = await lexruntime.send(command);
-    let audioData;
 
-    if (data.messages) {
-      const decodedBuffer = Buffer.from(data.messages, 'base64');
-      const decompressedData = zlib.unzipSync(decodedBuffer);
+    // Decode and decompress fields
+    const inputTranscript = decodeAndDecompress(data.inputTranscript);
+    const interpretations = decodeAndDecompress(data.interpretations);
+    const messages = decodeAndDecompress(data.messages);
+    const sessionStateResponse = decodeAndDecompress(data.sessionState);
+    const requestAttributesResponse = decodeAndDecompress(data.requestAttributes);
 
-      // audioData = decompressedData;
+    // Send the audio stream as a base64 string
+    const responseAudio = Buffer.from(await streamToBuffer(data.audioStream)).toString('base64');
 
-      // Identify audio format (optional)
-      const audioType = await type(decompressedData);
-      if (audioType) {
-        audioData = decompressedData; // Use this data for audio playback
-      } else {
-        console.warn('Received data in messages field is not recognized as audio.');
-      }
-    }
-
-    // Send text transcript and potentially audio data to React
     res.json({
-      textTranscript: data.inputTranscript,
-      audioData: audioData, // Include audio data if identified
+      audio: responseAudio,
+      inputTranscript: inputTranscript,
+      interpretations: interpretations,
+      messages: messages,
+      sessionState: sessionStateResponse,
+      requestAttributes: requestAttributesResponse,
     });
-
-    // const responseAudio = data.audioStream;
-    // const decodedAudio = Buffer.from(responseAudio).toString('base64');
-
-    // const nextSessionState = data.sessionAttributes ?
-    //   Buffer.from(JSON.stringify(data.sessionAttributes)).toString('base64') :
-    //   null;
-
-    // res.json({
-    //   audio: decodedAudio,
-    //   sessionState: nextSessionState
-    // });
   } catch (err) {
     console.error(err);
     res.status(500).send('Error processing audio');
@@ -148,6 +132,12 @@ function compressAndEncodeBase64(object) {
   const jsonString = JSON.stringify(object);
   const compressed = zlib.gzipSync(jsonString);
   return compressed.toString('base64');
+}
+
+function decodeAndDecompress(encoded) {
+  const buffer = Buffer.from(encoded, 'base64');
+  const decompressed = zlib.gunzipSync(buffer);
+  return JSON.parse(decompressed.toString());
 }
 
 function getAudioInfo(audioFilePath) {
@@ -183,5 +173,14 @@ function convertToWav(inputFilePath, outputFilePath) {
       .on('end', resolve)
       .on('error', reject)
       .run();
+  });
+}
+
+function streamToBuffer(stream) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on('data', (chunk) => chunks.push(chunk));
+    stream.on('end', () => resolve(Buffer.concat(chunks)));
+    stream.on('error', reject);
   });
 }
