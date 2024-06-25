@@ -53,6 +53,7 @@ app.post('/upload', upload.single('audio'), async (req, res) => {
     return res.status(400).send('No file uploaded');
   }
   let audioFilePath = req.file.path;
+  let { sessionId } = req.body;
 
   try {
     let audioInfo = getAudioInfo(audioFilePath);
@@ -90,7 +91,7 @@ app.post('/upload', upload.single('audio'), async (req, res) => {
       botAliasId: process.env.LEX_BOT_ALIAS_ID,
       botId: process.env.LEX_BOT_ID,
       localeId: 'en_US',
-      sessionId: 250901,
+      sessionId: sessionId,
       requestContentType: 'audio/l16; rate=16000; channels=1',
       responseContentType: 'audio/mpeg',
       inputStream: audioBuffer,
